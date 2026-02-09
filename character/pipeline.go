@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -103,8 +102,9 @@ func (p *Pipeline) Advance(meta *CharacterMeta) (assetURI string, err error) {
 
 // HashTraits computes the keccak256 hash of the canonical JSON encoding of
 // the provided traits.  Traits are sorted by (category, name) to ensure
-// deterministic hashing regardless of input order.
-func HashTraits(traits []Trait) common.Hash {
+// deterministic hashing regardless of input order.  keccak256 is used on
+// all chains (Ethereum natively, Solana via the keccak256 syscall).
+func HashTraits(traits []Trait) [32]byte {
 	// Sort for determinism
 	sorted := make([]Trait, len(traits))
 	copy(sorted, traits)
@@ -116,16 +116,19 @@ func HashTraits(traits []Trait) common.Hash {
 	})
 
 	canonical, _ := json.Marshal(sorted)
-	return common.BytesToHash(crypto.Keccak256(canonical))
+	var hash [32]byte
+	copy(hash[:], crypto.Keccak256(canonical))
+	return hash
 }
 
 // NewCharacterMeta creates an initial metadata object at StageText from a
 // set of traits.  It computes the trait hash and validates inputs.
-func NewCharacterMeta(name string, creator common.Address, traits []Trait) (*CharacterMeta, error) {
+func NewCharacterMeta(name string, creator string, chain ChainID, traits []Trait) (*CharacterMeta, error) {
 	if len(traits) == 0 {
 		return nil, ErrNoTraits
 	}
 	return &CharacterMeta{
+		Chain:     chain,
 		Creator:   creator,
 		Name:      name,
 		Traits:    traits,

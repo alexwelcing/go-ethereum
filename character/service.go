@@ -18,14 +18,11 @@ package character
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	"github.com/ethereum/go-ethereum/common"
-	charcontract "github.com/ethereum/go-ethereum/contracts/character"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -39,43 +36,66 @@ type MetadataStore interface {
 	Get(uri string) (*CharacterMeta, error)
 }
 
-// Service orchestrates the full text-to-character lifecycle:
+// Errors for the service layer.
+var (
+	ErrChainNotRegistered = errors.New("character service: requested chain has no registered backend")
+)
+
+// Service orchestrates the full text-to-character lifecycle across multiple
+// chains.  It is the single entry point for the platform:
 //  1. Accept text traits from the user
 //  2. Build metadata & compute trait hash
 //  3. Store metadata off-chain (IPFS, etc.)
-//  4. Mint the NFT on-chain (collecting mint fee)
+//  4. Mint the NFT on whichever chain the user picks (collecting mint fee)
 //  5. Let users advance their character through the pipeline
 //  6. Facilitate secondary sales (collecting transaction fee)
 //
 // The Service does NOT perform media generation — it delegates to
 // registered StageProcessors via the Pipeline.
 type Service struct {
-	nft      *charcontract.CharacterNFT
+	chains   map[ChainID]ChainBackend
 	pipeline *Pipeline
 	store    MetadataStore
 	fees     *FeeSchedule
-	opts     *bind.TransactOpts
 
 	mu    sync.RWMutex
-	cache map[uint64]*CharacterMeta // tokenID → metadata (in-memory cache)
+	cache map[cacheKey]*CharacterMeta
 }
 
-// NewService creates a new character service wired to an on-chain contract.
+// cacheKey uniquely identifies a character across chains.
+type cacheKey struct {
+	chain   ChainID
+	tokenID uint64
+}
+
+// NewService creates a new multi-chain character service.
 func NewService(
-	nft *charcontract.CharacterNFT,
 	pipeline *Pipeline,
 	store MetadataStore,
 	fees *FeeSchedule,
-	opts *bind.TransactOpts,
 ) *Service {
 	return &Service{
-		nft:      nft,
+		chains:   make(map[ChainID]ChainBackend),
 		pipeline: pipeline,
 		store:    store,
 		fees:     fees,
-		opts:     opts,
-		cache:    make(map[uint64]*CharacterMeta),
+		cache:    make(map[cacheKey]*CharacterMeta),
 	}
+}
+
+// RegisterChain adds a chain backend.  Call this for each chain you want
+// to support (e.g. Ethereum, Solana).
+func (s *Service) RegisterChain(backend ChainBackend) {
+	s.chains[backend.Chain()] = backend
+}
+
+// backend returns the registered backend for a chain, or an error.
+func (s *Service) backend(chain ChainID) (ChainBackend, error) {
+	b, ok := s.chains[chain]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrChainNotRegistered, chain)
+	}
+	return b, nil
 }
 
 // ──────────────────────────────────────────────
@@ -86,20 +106,27 @@ func NewService(
 type MintRequest struct {
 	Name   string  `json:"name"`
 	Traits []Trait `json:"traits"`
+	Chain  ChainID `json:"chain"` // which chain to mint on
 }
 
 // MintResult is returned after a successful mint.
 type MintResult struct {
-	MetadataURI string      `json:"metadata_uri"`
-	TraitHash   common.Hash `json:"trait_hash"`
-	TxHash      common.Hash `json:"tx_hash"`
+	MetadataURI string   `json:"metadata_uri"`
+	TraitHash   [32]byte `json:"trait_hash"`
+	TxHash      string   `json:"tx_hash"`
+	Chain       ChainID  `json:"chain"`
 }
 
 // Mint creates a new character from text traits, stores metadata, and mints
-// the NFT on-chain.  Returns the transaction hash and metadata URI.
-func (s *Service) Mint(creator common.Address, req *MintRequest) (*MintResult, error) {
+// the NFT on the requested chain.
+func (s *Service) Mint(creator string, req *MintRequest) (*MintResult, error) {
+	b, err := s.backend(req.Chain)
+	if err != nil {
+		return nil, err
+	}
+
 	// 1. Build off-chain metadata
-	meta, err := NewCharacterMeta(req.Name, creator, req.Traits)
+	meta, err := NewCharacterMeta(req.Name, creator, req.Chain, req.Traits)
 	if err != nil {
 		return nil, fmt.Errorf("character service: %v", err)
 	}
@@ -110,21 +137,19 @@ func (s *Service) Mint(creator common.Address, req *MintRequest) (*MintResult, e
 		return nil, fmt.Errorf("character service: failed to store metadata: %v", err)
 	}
 
-	// 3. Mint on-chain — caller must have attached >= mintFee in tx opts
-	oldValue := s.opts.Value
-	s.opts.Value = s.fees.QuoteMint()
-	tx, err := s.nft.Mint(uri, meta.TraitHash)
-	s.opts.Value = oldValue
+	// 3. Mint on-chain
+	txHash, err := b.Mint(uri, meta.TraitHash)
 	if err != nil {
-		return nil, fmt.Errorf("character service: mint tx failed: %v", err)
+		return nil, fmt.Errorf("character service: mint tx failed on %s: %v", req.Chain, err)
 	}
 
-	log.Info("Character minted", "name", req.Name, "tx", tx.Hash().Hex(), "uri", uri)
+	log.Info("Character minted", "name", req.Name, "chain", req.Chain, "tx", txHash, "uri", uri)
 
 	return &MintResult{
 		MetadataURI: uri,
 		TraitHash:   meta.TraitHash,
-		TxHash:      tx.Hash(),
+		TxHash:      txHash,
+		Chain:       req.Chain,
 	}, nil
 }
 
@@ -134,38 +159,41 @@ func (s *Service) Mint(creator common.Address, req *MintRequest) (*MintResult, e
 
 // Advance moves a character to the next stage by running the registered
 // processor, updating off-chain metadata, and recording the new URI on-chain.
-func (s *Service) Advance(tokenID uint64) (*types.Transaction, error) {
-	// Fetch current metadata
-	meta, err := s.getOrFetchMeta(tokenID)
+func (s *Service) Advance(chain ChainID, tokenID uint64) (string, error) {
+	b, err := s.backend(chain)
 	if err != nil {
-		return nil, err
+		return "", err
+	}
+
+	meta, err := s.getOrFetchMeta(chain, tokenID)
+	if err != nil {
+		return "", err
 	}
 
 	// Run the pipeline processor for the next stage
 	assetURI, err := s.pipeline.Advance(meta)
 	if err != nil {
-		return nil, fmt.Errorf("character service: pipeline advance failed: %v", err)
+		return "", fmt.Errorf("character service: pipeline advance failed: %v", err)
 	}
-	log.Info("Character stage advanced", "tokenID", tokenID, "stage", meta.Stage, "asset", assetURI)
+	log.Info("Character stage advanced", "chain", chain, "tokenID", tokenID, "stage", meta.Stage, "asset", assetURI)
 
 	// Persist updated metadata
 	newURI, err := s.store.Put(meta)
 	if err != nil {
-		return nil, fmt.Errorf("character service: failed to store updated metadata: %v", err)
+		return "", fmt.Errorf("character service: failed to store updated metadata: %v", err)
 	}
 
 	// Record on-chain
-	tx, err := s.nft.AdvanceStage(new(big.Int).SetUint64(tokenID), newURI)
+	txHash, err := b.AdvanceStage(tokenID, newURI)
 	if err != nil {
-		return nil, fmt.Errorf("character service: advanceStage tx failed: %v", err)
+		return "", fmt.Errorf("character service: advanceStage tx failed on %s: %v", chain, err)
 	}
 
-	// Update cache
 	s.mu.Lock()
-	s.cache[tokenID] = meta
+	s.cache[cacheKey{chain, tokenID}] = meta
 	s.mu.Unlock()
 
-	return tx, nil
+	return txHash, nil
 }
 
 // ──────────────────────────────────────────────
@@ -177,35 +205,35 @@ func (s *Service) QuoteSale(salePrice *big.Int) (platformCut, sellerProceeds *bi
 	return s.fees.PlatformCut(salePrice)
 }
 
-// Transfer facilitates a secondary sale of a character NFT.
-func (s *Service) Transfer(tokenID uint64, to common.Address, salePrice *big.Int) (*types.Transaction, error) {
-	oldValue := s.opts.Value
-	s.opts.Value = salePrice
-	tx, err := s.nft.TransferFrom(new(big.Int).SetUint64(tokenID), to)
-	s.opts.Value = oldValue
+// Transfer facilitates a secondary sale of a character NFT on any chain.
+func (s *Service) Transfer(chain ChainID, tokenID uint64, to string, salePrice *big.Int) (string, error) {
+	b, err := s.backend(chain)
 	if err != nil {
-		return nil, fmt.Errorf("character service: transfer tx failed: %v", err)
+		return "", err
+	}
+
+	txHash, err := b.TransferFrom(tokenID, to, salePrice)
+	if err != nil {
+		return "", fmt.Errorf("character service: transfer tx failed on %s: %v", chain, err)
 	}
 
 	platformCut, _, _ := s.fees.PlatformCut(salePrice)
-	log.Info("Character transferred", "tokenID", tokenID, "to", to.Hex(), "price", salePrice, "platformCut", platformCut)
+	log.Info("Character transferred", "chain", chain, "tokenID", tokenID, "to", to, "price", salePrice, "platformCut", platformCut)
 
-	// Invalidate cache for this token
 	s.mu.Lock()
-	delete(s.cache, tokenID)
+	delete(s.cache, cacheKey{chain, tokenID})
 	s.mu.Unlock()
 
-	return tx, nil
+	return txHash, nil
 }
 
 // ──────────────────────────────────────────────
 //  Reads
 // ──────────────────────────────────────────────
 
-// GetCharacter returns the off-chain metadata for a character, fetching
-// from the metadata store if not cached.
-func (s *Service) GetCharacter(tokenID uint64) (*CharacterMeta, error) {
-	return s.getOrFetchMeta(tokenID)
+// GetCharacter returns the off-chain metadata for a character.
+func (s *Service) GetCharacter(chain ChainID, tokenID uint64) (*CharacterMeta, error) {
+	return s.getOrFetchMeta(chain, tokenID)
 }
 
 // GetFeeSchedule returns the current fee schedule.
@@ -213,30 +241,45 @@ func (s *Service) GetFeeSchedule() *FeeSchedule {
 	return s.fees
 }
 
+// SupportedChains returns the list of registered chain backends.
+func (s *Service) SupportedChains() []ChainID {
+	chains := make([]ChainID, 0, len(s.chains))
+	for id := range s.chains {
+		chains = append(chains, id)
+	}
+	return chains
+}
+
 // getOrFetchMeta checks cache, then falls back to on-chain → metadata store.
-func (s *Service) getOrFetchMeta(tokenID uint64) (*CharacterMeta, error) {
+func (s *Service) getOrFetchMeta(chain ChainID, tokenID uint64) (*CharacterMeta, error) {
+	key := cacheKey{chain, tokenID}
+
 	s.mu.RLock()
-	if meta, ok := s.cache[tokenID]; ok {
+	if meta, ok := s.cache[key]; ok {
 		s.mu.RUnlock()
 		return meta, nil
 	}
 	s.mu.RUnlock()
 
-	// Read from chain to get metadata URI
-	info, err := s.nft.GetCharacter(new(big.Int).SetUint64(tokenID))
+	b, err := s.backend(chain)
 	if err != nil {
-		return nil, fmt.Errorf("character service: on-chain read failed: %v", err)
+		return nil, err
 	}
 
-	// Fetch from off-chain store
+	info, err := b.GetCharacter(tokenID)
+	if err != nil {
+		return nil, fmt.Errorf("character service: on-chain read failed on %s: %v", chain, err)
+	}
+
 	meta, err := s.store.Get(info.MetadataURI)
 	if err != nil {
 		return nil, fmt.Errorf("character service: metadata fetch failed for %s: %v", info.MetadataURI, err)
 	}
 	meta.TokenID = tokenID
+	meta.Chain = chain
 
 	s.mu.Lock()
-	s.cache[tokenID] = meta
+	s.cache[key] = meta
 	s.mu.Unlock()
 
 	return meta, nil
@@ -246,8 +289,8 @@ func (s *Service) getOrFetchMeta(tokenID uint64) (*CharacterMeta, error) {
 //  JSON-RPC API (for node integration)
 // ──────────────────────────────────────────────
 
-// API exposes the character service over JSON-RPC when registered with a
-// go-ethereum node.  Method namespace: "character".
+// API exposes the character service over JSON-RPC.
+// Method namespace: "character".
 type API struct {
 	service *Service
 }
@@ -258,7 +301,7 @@ func NewAPI(service *Service) *API {
 }
 
 // Mint handles "character_mint" RPC calls.
-func (api *API) Mint(creator common.Address, reqJSON json.RawMessage) (*MintResult, error) {
+func (api *API) Mint(creator string, reqJSON json.RawMessage) (*MintResult, error) {
 	var req MintRequest
 	if err := json.Unmarshal(reqJSON, &req); err != nil {
 		return nil, fmt.Errorf("invalid mint request: %v", err)
@@ -267,8 +310,8 @@ func (api *API) Mint(creator common.Address, reqJSON json.RawMessage) (*MintResu
 }
 
 // GetCharacter handles "character_getCharacter" RPC calls.
-func (api *API) GetCharacter(tokenID uint64) (*CharacterMeta, error) {
-	return api.service.GetCharacter(tokenID)
+func (api *API) GetCharacter(chain string, tokenID uint64) (*CharacterMeta, error) {
+	return api.service.GetCharacter(ChainID(chain), tokenID)
 }
 
 // QuoteMint handles "character_quoteMint" RPC calls.
@@ -290,4 +333,9 @@ func (api *API) QuoteSale(salePriceWei string) (map[string]string, error) {
 		"platformCut":    cut.String(),
 		"sellerProceeds": proceeds.String(),
 	}, nil
+}
+
+// SupportedChains handles "character_supportedChains" RPC calls.
+func (api *API) SupportedChains() []ChainID {
+	return api.service.SupportedChains()
 }
